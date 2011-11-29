@@ -30,8 +30,19 @@ Usage:
   filter_request and filter_response as desired. See the example scripts for
   more information.
 
-usage: CherryProxy.py -h
+Usage as a script: CherryProxy.py [options]
 
+Options:
+  -h, --help            show this help message and exit
+  -p PORT, --port=PORT  port for HTTP proxy, 8070 by default
+  -a ADDRESS, --address=ADDRESS
+                        IP address of interface for HTTP proxy (0.0.0.0 for
+                        all, default=localhost)
+  -f PROXY, --forward=PROXY
+                        Forward requests to parent proxy, specified as
+                        hostname[:port] or IP address[:port]
+  -v, --verbose         Verbose mode, display debugging messages
+  -l, --log             Log each request to a separate file (use with -v)
 """
 
 #------------------------------------------------------------------------------
@@ -56,11 +67,13 @@ usage: CherryProxy.py -h
 # 2011-09-30 v0.11 PL: - added methods to filter headers before reading body
 # 2011-11-15 v0.12 PL: - moved and renamed private methods with an underscore
 #                      - added option to use a parent proxy
-
+# 2011-11-29 v0.13 PL: - new option (-l) to log each request to a file
+#                      - black list to block unsupported HTTP methods and schemes
 
 #------------------------------------------------------------------------------
 # TODO:
-# + update CherryPy WSGI server to the latest version
+# + log_file: fix debug level without -v, add formatter
+# + CLI option to dump request and response data using repr()
 # + disable debug options
 # + fix examples, using CT+filename, blocking some requests
 # + simple doc describing API
@@ -71,11 +84,11 @@ usage: CherryProxy.py -h
 # + init option to enable debug messages or not
 # + force connection close and remove keep-alive on server side
 # + close connection on server side when needed
-# - option to log to a file
 # + _send_request: reconstruct URL from its elements (if they were changed)
-
+# + _send_request: handle connection errors
 
 # TODO LATER:
+# - update CherryPy WSGI server to the latest version 3.2.2
 # - option to save each request and response (before and after adaptation) to a file
 # - later, reuse http connection when no connection close header or keep-alive
 # - option to uncompress body when gzip/deflate/compress is used
@@ -91,9 +104,13 @@ import urlparse, urllib2, httplib, sys, threading, logging
 
 #--- CONSTANTS ----------------------------------------------------------------
 
-__version__ = '0.12'
+__version__ = '0.13'
 
 SERVER_NAME = 'CherryProxy/%s' % __version__
+
+# Not supported methods and schemes
+BLACKLIST_METHODS = ['CONNECT']
+BLACKLIST_SCHEMES = ['https']
 
 
 #=== CLASSES ==================================================================
@@ -110,8 +127,14 @@ class CherryProxy (object):
     See the example scripts for more information.
     """
 
+    # class variables:
+    # unique id for each request
+    _reqid = 0
+    _lock_reqid = threading.Lock()
+
     def __init__(self, address='localhost', port=8070, server_name=SERVER_NAME,
-        debug=False, log_level=logging.INFO, options=None, parent_proxy=None):
+        debug=False, log_level=logging.INFO, options=None, parent_proxy=None,
+        log_file=False):
         """
         CherryProxy constructor
 
@@ -124,10 +147,8 @@ class CherryProxy (object):
         options: None or optparse.OptionParser object to provide additional options
         parent_proxy: parent proxy, either IP address or hostname, with optional
             port (example: 'myproxy.local:8080')
+        log_file: bool, if True a log file will be generated for each request
         """
-        # initialize logging
-        self.log = logging.getLogger('CProxy')
-        self.log.setLevel(log_level)
         # create HTTP server
         self.address = address
         self.port = port
@@ -143,6 +164,15 @@ class CherryProxy (object):
             self.debug = self._debug_disabled
             self.debug_mode = False
         self.options = options
+        # initialize logging
+        self.log_level = log_level
+##        self.log = logging.getLogger('CProxy')
+##        self.log.setLevel(log_level)
+        # default logger
+        self.req.log = logging.getLogger('CProxy')
+        self.req.log.setLevel(log_level)
+        self.log_file = log_file
+        # parent proxy
         self.parent_proxy = parent_proxy
         if parent_proxy:
             self.debug('Using parent proxy: %s' % parent_proxy)
@@ -152,7 +182,7 @@ class CherryProxy (object):
         """
         start proxy server
         """
-        self.log.info('CherryProxy listening on %s:%d (press Ctrl+C to stop)'
+        self.req.log.info('CherryProxy listening on %s:%d (press Ctrl+C to stop)'
             % (self.address, self.port))
         self.server.start()
 
@@ -162,7 +192,7 @@ class CherryProxy (object):
         stop proxy server
         """
         self.server.stop()
-        self.log.info('CherryProxy stopped.')
+        self.req.log.info('CherryProxy stopped.')
 
 
     def filter_request_headers(self):
@@ -177,9 +207,10 @@ class CherryProxy (object):
 
         The following attributes can be read and MODIFIED:
             self.req.headers: dictionary of HTTP headers, with lowercase names
-            self.req.method: HTTP method, e.g. GET, POST, etc
-            self.req.scheme: protocol from URL, e.g. http or https
-            self.req.netloc: IP address or hostname of server, with optional port
+            self.req.method: HTTP method, e.g. 'GET', 'POST', etc
+            self.req.scheme: protocol from URL, e.g. 'http' or 'https'
+            self.req.netloc: IP address or hostname of server, with optional
+                             port, for example 'www.google.com' or '1.2.3.4:8000'
             self.req.path: path in URL, for example '/folder/index.html'
             self.req.query: query string, found after question mark in URL
 
@@ -189,9 +220,9 @@ class CherryProxy (object):
             self.req.url: partial URL containing 'path?query'
             self.req.full_url: full URL containing 'scheme:netloc/path?query'
             self.req.length: length of request data in bytes, 0 if none
-            self.req.content_type = None
-            self.req.charset = None
-            self.req.url_filename = None
+            self.req.content_type: content-type, for example 'text/html'
+            self.req.charset: charset, for example 'UTF-8'
+            self.req.url_filename: filename extracted from URL path
         """
         pass
 
@@ -222,6 +253,19 @@ class CherryProxy (object):
 
         This method may call set_response() if the response needs to be blocked
         (e.g. replaced by a simple response) before being sent to the client.
+
+        The following attributes can be read and MODIFIED:
+            self.resp.status: int, HTTP status of response, e.g. 200, 404, etc
+            self.resp.reason: reason string, e.g. 'OK', 'Not Found', etc
+            self.resp.headers: response headers, list of (header, value) tuples
+
+        The following attributes can be READ only:
+            self.resp.httpconn: httplib.HTTPConnection object
+            self.resp.response: httplib.HTTPResponse object
+            self.resp.content_type: content-type of response
+            self.resp.charset: charset of response
+            self.resp.content_disp_filename: filename extracted from
+                                             content-disposition header
         """
         pass
 
@@ -235,6 +279,10 @@ class CherryProxy (object):
 
         This method may call set_response() if the response needs to be blocked
         (e.g. replaced by a simple response) before being sent to the client.
+
+        The following attributes can be read and MODIFIED:
+            self.resp.data: data sent with the response
+            (and also all listed in filter_response_headers)
         """
         pass
 
@@ -324,6 +372,27 @@ class CherryProxy (object):
         """
         Initialize variables when a new request is received
         """
+        # set request id (simply increase number at each request)
+        with self._lock_reqid:
+            self._reqid +=1
+            self.req.reqid = self._reqid
+        reqname = 'Req%05d' % self.req.reqid
+        # set a logger for each request
+        # check if there is already one, set by a previous request:
+        if not hasattr(self.req, 'log'):
+            # no logger yet for this thread, create one:
+            self.req.log = logging.getLogger(reqname)
+            self.req.log.setLevel(self.log_level)
+        if self.log_file:
+            # force logging level to debug:
+            self.req.log.setLevel(logging.DEBUG)
+            # close and remove file handler from previous request:
+            if hasattr(self.req, '_log_handler'):
+                self.req._log_handler.close()
+                self.req.log.removeHandler(self.req._log_handler)
+            # add a file handler for this request
+            self.req._log_handler = logging.FileHandler(reqname+'.log', 'w')
+            self.req.log.addHandler(self.req._log_handler)
         # request variables
         self.req.environ = {}
         self.req.headers = {}
@@ -376,14 +445,16 @@ class CherryProxy (object):
         self.req.method = environ['REQUEST_METHOD'] # GET, POST, HEAD, etc
         self.req.scheme = environ['wsgi.url_scheme'] # http
         self.req.netloc = environ['SERVER_NAME'] # www.server.com[:80]
-        self.req.path = environ['PATH_INFO'] # /folder/index.html
-        self.req.query = environ['QUERY_STRING']
+        self.req.path   = environ['PATH_INFO'] # /folder/index.html
+        self.req.query  = environ['QUERY_STRING']
         # URL=/path?query used when forwarding directly to the server
         self.req.url = urlparse.urlunsplit(
             ('', '', self.req.path, self.req.query, ''))
+        self.debug('req.url = %s' % self.req.url)
         # full URL used when forwarding to a parent proxy
         self.req.full_url = urlparse.urlunsplit(
             (self.req.scheme, self.req.netloc, self.req.path, self.req.query, ''))
+        self.debug('req.full_url = %s' % self.req.full_url)
         # parse content-type and charset:
         # see RFC 2616: http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.17
         #ct = self.req.headers.get('content-type', None)
@@ -395,13 +466,26 @@ class CherryProxy (object):
                 self.req.charset = charset.strip()
             else:
                 self.req.content_type = ct.strip()
-        self.debug('req.content_type = "%s"' % self.req.content_type)
-        self.debug('req.charset      = "%s"' % self.req.charset)
+        self.debug('req.content_type = %s' % repr(self.req.content_type))
+        self.debug('req.charset      = %s' % repr(self.req.charset))
         #self.debug('- '*25)
-        self.log.info('Request %s %s' % (self.req.method, self.req.full_url))
+        self.req.log.info('Request %s %s' % (self.req.method, self.req.full_url))
         # init values before reading request body
         self.req.length = 0
         self.req.data = None
+        # Reject request if method or scheme is not allowed:
+        if self.req.method in BLACKLIST_METHODS:
+            # here I use 501 "not implemented" rather than 405 or 401, because
+            # it seems to be the most appropriate response according to RFC 2616.
+            # see http://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html
+            msg = 'Method "%s" not supported.' % self.req.method
+            self.set_response(501, reason=msg)
+            self.req.log.error(msg)
+        if self.req.scheme in BLACKLIST_SCHEMES:
+            msg = 'Scheme "%s" not supported.' % self.req.scheme
+            self.set_response(501, reason=msg)
+            self.req.log.error(msg)
+
 
 
     def _read_request_body(self):
@@ -444,6 +528,7 @@ class CherryProxy (object):
         self.resp.httpconn = httplib.HTTPConnection(netloc)
 ##        if self.debug_mode:
 ##            self.resp.httpconn.set_debuglevel(1)
+        #TODO: handle connection errors
         self.resp.httpconn.request(self.req.method, url,
             body=self.req.data, headers=self.req.headers)
         self.resp.response = self.resp.httpconn.getresponse()
@@ -464,7 +549,7 @@ class CherryProxy (object):
         # parse content-type and charset:
         # using mimetools.Message.gettype() on HTTPResponse.msg
         self.resp.content_type = self.resp.response.msg.gettype().lower()
-        self.debug('resp.content_type = %s' % self.resp.content_type)
+        self.debug('resp.content_type = %s' % repr(self.resp.content_type))
 ##        ct = self.resp.headers.get('content-type', None)
 ##        if ';' in ct:
 ##            ct, charset = ct.split(';', 1)
@@ -472,7 +557,7 @@ class CherryProxy (object):
 ##            self.req.charset = charset.strip()
 ##        elif ct is not None:
 ##            self.req.content_type = ct.strip()
-        self.log.info('Response %s %s' % (self.resp.status, self.resp.reason))
+        self.req.log.info('Response %s %s' % (self.resp.status, self.resp.reason))
 
 
 
@@ -504,7 +589,8 @@ class CherryProxy (object):
         debug method when debug mode is enabled
         """
         #print string
-        self.log.debug(string)
+        #self.req.log.debug(string)
+        self.req.log.debug(string)
 
     def _debug_disabled(self, string):
         """
@@ -534,8 +620,10 @@ def main(cproxy=CherryProxy, optionparser=None):
                       help="IP address of interface for HTTP proxy (0.0.0.0 for all, default=localhost)")
     parser.add_option("-f", "--forward", dest="proxy", default=None,
                       help="Forward requests to parent proxy, specified as hostname[:port] or IP address[:port]")
-    parser.add_option("-v", "--verbose",
-                      action="store_true", dest="verbose")
+    parser.add_option("-v", "--verbose", action="store_true", dest="verbose",
+                      help='Verbose mode, display debugging messages')
+    parser.add_option("-l", "--log", action="store_true", dest="log_file",
+                      help='Log each request to a separate file (use with -v)')
     (options, args) = parser.parse_args()
     if len(args) != 0:
         parser.error("incorrect number of arguments")
@@ -551,11 +639,13 @@ def main(cproxy=CherryProxy, optionparser=None):
         pass
 
     # setup logging
-    logging.basicConfig(format='%(name)s-%(thread)05d: %(levelname)-8s %(message)s', level=logging.DEBUG)
+    logging.basicConfig(format='%(name)s-%(thread)05d: %(levelname)-8s %(message)s',
+        level=log_level)
 
     print __doc__
     proxy = cproxy(address=options.address, port=options.port,
-        debug=debug, log_level=log_level, options=options, parent_proxy=options.proxy)
+        debug=debug, log_level=log_level, options=options,
+        parent_proxy=options.proxy, log_file=options.log_file)
     while True:
         try:
             proxy.start()

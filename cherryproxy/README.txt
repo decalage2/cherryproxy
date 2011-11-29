@@ -27,8 +27,20 @@ PERFORMANCE OF THIS SOFTWARE.
 
 USAGE AS A TOOL (simple proxy):
 
-1) run CherryProxy [-d]
-   -d: debug mode
+1) run CherryProxy.py [options]
+
+Options:
+  -h, --help            show this help message and exit
+  -p PORT, --port=PORT  port for HTTP proxy, 8070 by default
+  -a ADDRESS, --address=ADDRESS
+                        IP address of interface for HTTP proxy (0.0.0.0 for
+                        all, default=localhost)
+  -f PROXY, --forward=PROXY
+                        Forward requests to parent proxy, specified as
+                        hostname[:port] or IP address[:port]
+  -v, --verbose         Verbose mode, display debugging messages
+  -l, --log             Log each request to a separate file (use with -v)
+
 2) setup your browser to use localhost:8070 as proxy
 
 
